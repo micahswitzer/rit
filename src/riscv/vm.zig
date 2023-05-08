@@ -929,11 +929,16 @@ pub fn Disassembler(comptime Reader: type) type {
                     return parts;
                 },
                 .J => {
-                    try parts.storeFrom(rd);
                     var tmp = parts.reserveAll();
+                    if (enc.j.rd == 0) {
+                        const shamt = std.fmt.bufPrintIntToSlice(tmp, pc +% immU(enc.j.imm()), 16, .lower, .{});
+                        parts.commitSlice(shamt);
+                    } else {
+                        try parts.storeFrom(rd);
                     // can fail...
                     const shamt = std.fmt.bufPrintIntToSlice(tmp, enc.j.imm(), 16, .lower, .{});
                     parts.commitSlice(shamt);
+                    }
                     return parts;
                 },
             };
