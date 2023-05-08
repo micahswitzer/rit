@@ -28,6 +28,11 @@ pub fn main() !void {
 
     var rvm = vm.VM.init(contents, 0, origin);
 
+    if (args.len > 3) for (args[3..], 10..) |arg, i| {
+        const val = try std.fmt.parseInt(u32, arg, 0);
+        rvm.regs.write(@intCast(u5, i), val);
+    };
+
     while (true) {
         rvm.step() catch |e| {
             if (e == error.StopEmulation) {
