@@ -217,10 +217,10 @@ const Encoding = packed union {
     u: U,
     j: J,
 
-    pub inline fn from(raw: u32) @This() {
+    pub inline fn from(raw: u32) !@This() {
         // this function allows for potentially storing each decoding separately in the future
-        // assert that this is a 32-bit instruction
-        std.debug.assert(raw & 0b11 == 0b11);
+        if (raw & 0b11 != 0b11)
+            return error.Unsupported;
         return .{ .raw = raw };
     }
 
@@ -546,7 +546,10 @@ pub fn Disassembler(comptime Reader: type) type {
 
         /// Return value is only valid
         pub fn next(self: *@This(), buf: []u8) Error!?Disassembled {
-            const enc = Encoding.from(self.reader.readIntLittle(u32) catch return null);
+            const raw = self.reader.readIntLittle(u32) catch return null;
+            if (raw == 0)
+                return null;
+            const enc = try Encoding.from(raw);
             const mnem = try anotherDecode(enc);
             var parts = Disassembled{ .backing = buf };
             const mnem_str = @tagName(mnem);
