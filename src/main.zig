@@ -17,6 +17,29 @@ pub fn main() !void {
     const origin = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 0) else 0;
 
     try vm.dumpDisassembled(file.reader(), origin);
+
+    const contents = try alloc.alloc(u8, 4096 * 16);
+    defer alloc.free(contents);
+
+    @memset(contents, 0);
+
+    try file.seekTo(0);
+    _ = try file.readAll(contents[origin..]);
+
+    var rvm = vm.VM.init(contents, 0, origin);
+
+    while (true) {
+        rvm.step() catch |e| {
+            if (e == error.StopEmulation) {
+                std.debug.print("emulation stopped due to ebreak\n", .{});
+            } else {
+                std.debug.print("emulation stopped due to error: {s}\n", .{@errorName(e)});
+            }
+            break;
+        };
+    }
+
+    rvm.regs.dump();
 }
 
 test {

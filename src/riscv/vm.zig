@@ -8,12 +8,344 @@ const gp_reg_count = 32;
 const Reg = u5;
 
 const RegisterFile = struct {
-    const RA = 1;
-    const SP = 2;
-    const LINK = 5;
-
     x: [gp_reg_count]XSz,
     pc: XSz,
+
+    pub fn write(self: *@This(), rd: Reg, val: u32) void {
+        if (rd == 0)
+            return;
+        self.x[rd] = val;
+    }
+
+    pub fn read(self: *const @This(), rs: Reg) u32 {
+        if (rs == 0)
+            return 0;
+        return self.x[rs];
+    }
+
+    pub fn advancePC(self: *@This(), step: u3) void {
+        self.pc += step;
+    }
+
+    pub fn updatePC(self: *@This(), new: u32) void {
+        self.pc = new;
+    }
+
+    pub fn getPC(self: *const @This()) u32 {
+        return self.pc;
+    }
+
+    pub fn dump(self: *const @This()) void {
+        for (0..gp_reg_count) |i| {
+            const reg = @intCast(Reg, i);
+            const val_u = self.read(reg);
+            const val_s = @bitCast(i32, val_u);
+            std.debug.print("x{}, {s} = 0x{x:0>8} ({})\n", .{ reg, GPR.get(reg).str(), val_u, val_s });
+        }
+        std.debug.print("pc = 0x{x:0>8}\n", .{self.getPC()});
+    }
+};
+
+const Memory = struct {
+    storage: []u8,
+    base: u32,
+
+    const Size = enum(u3) {
+        byte = 1,
+        short = 2,
+        word = 4,
+
+        fn Type(comptime self: @This()) type {
+            return switch (self) {
+                .byte => u8,
+                .short => u16,
+                .word => u32,
+            };
+        }
+    };
+
+    const Value = union(Size) {
+        byte: Size.Type(.byte),
+        short: Size.Type(.short),
+        word: Size.Type(.word),
+    };
+
+    const Error = error{
+        BadAlignment,
+        BadAddress,
+    };
+
+    fn validateAddress(self: *@This(), addr: u32, size: Size) ![]u8 {
+        const int_size = @enumToInt(size);
+        if (addr % int_size != 0)
+            return error.BadAlignment;
+        if (addr < self.base or addr + int_size > self.base + self.storage.len)
+            return error.BadAddress;
+        const idx = addr - self.base;
+        return self.storage[idx..][0..int_size];
+    }
+
+    pub fn load(self: *@This(), addr: u32, size: Size) !Value {
+        const slice = try self.validateAddress(addr, size);
+        return switch (size) {
+            .byte => .{ .byte = @ptrCast(*u8, slice.ptr).* },
+            .short => .{ .short = @ptrCast(*align(1) u16, slice.ptr).* },
+            .word => .{ .word = @ptrCast(*align(1) u32, slice.ptr).* },
+        };
+    }
+
+    pub fn store(self: *@This(), addr: u32, value: Value) !void {
+        const slice = try self.validateAddress(addr, std.meta.activeTag(value));
+        switch (value) {
+            .byte => |raw| @ptrCast(*u8, slice.ptr).* = raw,
+            .short => |raw| @ptrCast(*align(1) u16, slice.ptr).* = raw,
+            .word => |raw| @ptrCast(*align(1) u32, slice.ptr).* = raw,
+        }
+    }
+};
+
+const Decoded = struct {
+    rd: Reg = undefined,
+    rs1: Reg = undefined,
+    rs2: Reg = undefined,
+    imm: u32 = undefined,
+
+    pub fn byKind(comptime kind: Encoding.Kind, comptime pcrel: bool, enc: Encoding, pc: u32) @This() {
+        comptime {
+            switch (kind) {
+                .I, .S => std.debug.assert(!pcrel),
+                .B, .J => std.debug.assert(pcrel),
+                .R, .U => {},
+            }
+        }
+        return switch (kind) {
+            .R => .{
+                .rd = enc.r.rd,
+                .rs1 = enc.r.rs1,
+                .rs2 = enc.r.rs2,
+            },
+            .I => .{
+                .rd = enc.i.rd,
+                .rs1 = enc.i.rs1,
+                .imm = immU(enc.i.imm()),
+            },
+            .S => .{
+                .rs1 = enc.s.rs1,
+                .rs2 = enc.s.rs2,
+                .imm = immU(enc.s.imm()),
+            },
+            .B => .{
+                .rs1 = enc.b.rs1,
+                .rs2 = enc.b.rs2,
+                .imm = pc +% immU(enc.b.imm()),
+            },
+            .J => .{
+                .rd = enc.j.rd,
+                .imm = pc +% immU(enc.j.imm()),
+            },
+            .U => .{
+                .rd = enc.u.rd,
+                .imm = if (pcrel) pc +% immU(enc.u.imm()) else immU(enc.u.imm()),
+            },
+        };
+    }
+};
+
+const PCDecoded = struct {
+    pc: u32,
+    enc: Encoding,
+
+    fn abs(self: @This(), comptime kind: Encoding.Kind) Decoded {
+        return Decoded.byKind(kind, false, self.enc, undefined);
+    }
+
+    fn rel(self: @This(), comptime kind: Encoding.Kind) Decoded {
+        return Decoded.byKind(kind, true, self.enc, self.pc);
+    }
+
+    fn auto(self: @This(), comptime kind: Encoding.Kind) Decoded {
+        return Decoded.byKind(kind, switch (kind) {
+            .R, .I, .S => false,
+            .B, .J => true,
+            else => unreachable,
+        }, self.enc, self.pc);
+    }
+};
+
+pub const VM = struct {
+    regs: RegisterFile,
+    memory: Memory,
+
+    const Error = Memory.Error || error{StopEmulation};
+
+    pub fn init(memory: []u8, base_addr: u32, initial_pc: u32) @This() {
+        return .{
+            .regs = .{
+                .pc = initial_pc,
+                .x = undefined,
+            },
+            .memory = .{
+                .storage = memory,
+                .base = base_addr,
+            },
+        };
+    }
+
+    fn lui(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        _ = mnem;
+        self.regs.write(dec.rd, dec.imm);
+    }
+
+    fn load(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        const size: Memory.Size = switch (mnem) {
+            .Lb, .Lbu => .byte,
+            .Lh, .Lhu => .short,
+            .Lw => .word,
+            else => unreachable,
+        };
+        const addr = dec.imm +% self.regs.read(dec.rs1);
+        const val = try self.memory.load(addr, size);
+        self.regs.write(dec.rd, switch (mnem) {
+            .Lb => immU(@bitCast(i8, val.byte)),
+            .Lbu => @as(u32, val.byte),
+            .Lh => immU(@bitCast(i16, val.short)),
+            .Lhu => @as(u32, val.short),
+            .Lw => val.word,
+            else => unreachable,
+        });
+    }
+
+    fn store(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        const raw = self.regs.read(dec.rs2);
+        const value: Memory.Value = switch (mnem) {
+            .Sb => .{ .byte = @truncate(Memory.Size.Type(.byte), raw) },
+            .Sh => .{ .short = @truncate(Memory.Size.Type(.short), raw) },
+            .Sw => .{ .word = @truncate(Memory.Size.Type(.word), raw) },
+            else => unreachable,
+        };
+        const addr = dec.imm +% self.regs.read(dec.rs1);
+        try self.memory.store(addr, value);
+    }
+
+    fn jump(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        const base = switch (mnem) {
+            .J, .Jal => 0,
+            .Jr, .Jalr, .Ret => self.regs.read(dec.rs1),
+            else => unreachable,
+        };
+        const dest = base +% dec.imm;
+        self.regs.write(dec.rd, self.regs.getPC());
+        self.regs.updatePC(dest);
+    }
+
+    fn condBr(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        const lhs_u = self.regs.read(dec.rs1);
+        const lhs_s = @bitCast(i32, lhs_u);
+        const rhs_u = self.regs.read(dec.rs2);
+        const rhs_s = @bitCast(i32, rhs_u);
+        const taken = switch (mnem) {
+            .Beq => lhs_u == rhs_u,
+            .Bne => lhs_u != rhs_u,
+            .Blt => lhs_s < rhs_s,
+            .Bge => lhs_s >= rhs_s,
+            .Bltu => lhs_u < rhs_u,
+            .Bgeu => lhs_u >= rhs_u,
+            else => unreachable,
+        };
+        if (taken)
+            self.regs.updatePC(dec.imm);
+    }
+
+    fn arithI(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        const lhs_u = self.regs.read(dec.rs1);
+        const lhs_s = @bitCast(i32, lhs_u);
+        const rhs_u = dec.imm;
+        const rhs_s = @bitCast(i32, rhs_u);
+        const shift = dec.rs2;
+        const res: u32 = switch (mnem) {
+            .Mv, .Addi => lhs_u +% rhs_u,
+            .Slti => @boolToInt(lhs_s < rhs_s),
+            .Sltiu => @boolToInt(lhs_u < rhs_u),
+            .Not, .Xori => lhs_u ^ rhs_u,
+            .Ori => lhs_u | rhs_u,
+            .Andi => lhs_u & rhs_u,
+            .Slli => lhs_u << shift,
+            .Srli => lhs_u >> shift,
+            .Srai => @bitCast(u32, lhs_s >> shift),
+            else => unreachable,
+        };
+        self.regs.write(dec.rd, res);
+    }
+
+    fn arithR(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        const lhs_u = self.regs.read(dec.rs1);
+        const lhs_s = @bitCast(i32, lhs_u);
+        const rhs_u = self.regs.read(dec.rs2);
+        const rhs_s = @bitCast(i32, rhs_u);
+        const shift = @truncate(u5, rhs_u);
+        const res: u32 = switch (mnem) {
+            .Add => lhs_u +% rhs_u,
+            .Sub => lhs_u -% rhs_u,
+            .Sll => lhs_u << shift,
+            .Slt => @boolToInt(lhs_s < rhs_s),
+            .Sltu => @boolToInt(lhs_u < rhs_u),
+            .Xor => lhs_u ^ rhs_u,
+            .Srl => lhs_u >> shift,
+            .Sra => @bitCast(u32, lhs_s >> shift),
+            .Or => lhs_u | rhs_u,
+            .And => lhs_u & rhs_u,
+            else => unreachable,
+        };
+        self.regs.write(dec.rd, res);
+    }
+
+    fn env(self: *@This(), dec: Decoded, mnem: Mnemonic) !void {
+        _ = dec;
+        std.log.debug("{x:0>8}  {s}", .{ self.regs.getPC() - 4, switch (mnem) {
+            .Ebreak => "ebreak",
+            .Ecall => "ecall",
+            else => unreachable,
+        } });
+        return error.StopEmulation;
+    }
+
+    pub fn step(self: *@This()) !void {
+        const pc = self.regs.getPC();
+        const raw_insn = try self.memory.load(pc, .word);
+        self.regs.advancePC(4);
+        const enc = try Encoding.from(raw_insn.word);
+        const mnem = try anotherDecode(enc);
+
+        const i = PCDecoded{ .pc = pc, .enc = enc };
+
+        const dec: Decoded = switch (mnem) {
+            .Auipc => i.rel(.U),
+            .Lui => i.abs(.U),
+            .J, .Jal => i.auto(.J),
+            .Jr, .Jalr, .Ret => i.auto(.I),
+            .Beq, .Bne, .Blt, .Bge, .Bltu, .Bgeu => i.auto(.B),
+            .Lb, .Lh, .Lw, .Lbu, .Lhu => i.auto(.I),
+            .Sb, .Sh, .Sw => i.auto(.S),
+            .Not, .Mv, .Addi, .Slti, .Sltiu, .Xori, .Ori, .Andi => i.auto(.I),
+            .Slli, .Srli, .Srai => i.auto(.R),
+            .Add, .Sub, .Sll, .Slt, .Sltu, .Xor, .Srl, .Sra, .Or, .And => i.auto(.R),
+            .Nop, .Fence, .@"Fence.Tso", .Ecall, .Ebreak => undefined,
+        };
+
+        const func: *const fn (*@This(), Decoded, Mnemonic) Error!void = switch (mnem) {
+            .Auipc, .Lui => lui,
+            .J, .Jr, .Jal, .Jalr, .Ret => jump,
+            .Beq, .Bne, .Blt, .Bge, .Bltu, .Bgeu => condBr,
+            .Lb, .Lh, .Lw, .Lbu, .Lhu => load,
+            .Sb, .Sh, .Sw => store,
+            .Not, .Mv, .Addi, .Slti, .Sltiu, .Xori, .Ori, .Andi, .Slli, .Srli, .Srai => arithI,
+            .Add, .Sub, .Sll, .Slt, .Sltu, .Xor, .Srl, .Sra, .Or, .And => arithR,
+            .Ecall, .Ebreak => env,
+            .Nop, .Fence, .@"Fence.Tso" => return,
+        };
+
+        try func(self, dec, mnem);
+    }
 };
 
 // zig fmt: off

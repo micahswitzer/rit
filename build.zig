@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     });
     riscv_elf.strip = true;
 
-    const riscv_bin = b.addObjCopy(riscv_elf.getOutputSource(), .{ .format = .bin, .only_section = ".text" });
+    const riscv_bin = b.addObjCopy(riscv_elf.getOutputSource(), .{ .format = .bin });
 
     b.getInstallStep().dependOn(&b.addInstallBinFile(riscv_elf.getOutputSource(), "sample.elf").step);
 
